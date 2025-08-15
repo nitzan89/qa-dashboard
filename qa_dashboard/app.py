@@ -64,12 +64,23 @@ with c4:
     if load_clicked:
         st.session_state.ingesting = True
         try:
-            # Keep ingest simple & reliable: always load last 5 days.
+            # Always ingest the last 5 days; UI window filters what you see.
+            prog = st.progress(0)
+            log_box = st.empty()
+
+            def cb(step, total, msg):
+                # clamp to [0,1]
+                frac = 0 if total == 0 else min(1.0, max(0.0, step / float(total)))
+                prog.progress(frac, text=msg)
+                log_box.info(msg)
+
             with st.spinner("Fetching last 5 day(s) from Zendesk…"):
-                msg = ingest_mod.ingest(days=5)
+                msg = ingest_mod.ingest(days=5, progress_cb=cb)
             st.toast(msg, icon="✅")
+            prog.progress(1.0, text="Done")
         finally:
             st.session_state.ingesting = False
+
 
 with st.expander("Advanced filters (optional)", expanded=False):
     include_tags = st.text_input("Include tags (comma-separated)", "")
