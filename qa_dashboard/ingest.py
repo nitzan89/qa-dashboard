@@ -53,18 +53,34 @@ def get_json(url, params=None):
 
 # Simple caches to cut API calls
 _user_cache = {}
-_group_cache = {}
 
 def get_user(user_id: int):
     """
-    GET /users/{id}.json
+    Safe user fetch:
+    - Return a stub for system/unknown authors (user_id <= 0 or None)
+    - Swallow 400/404 and return a stub
+    - Cache to reduce API calls
     """
+    # Stub for system/unknown/deleted
+    if not user_id or (isinstance(user_id, int) and user_id <= 0):
+        return {"id": user_id, "email": "", "name": "Unknown"}
+
     if user_id in _user_cache:
         return _user_cache[user_id]
-    data = get_json(f"{_base()}/users/{user_id}.json")
-    user = data.get("user", {})
+
+    try:
+        data = get_json(f"{_base()}/users/{user_id}.json")
+        user = data.get("user", {}) or {"id": user_id, "email": "", "name": "Unknown"}
+    except requests.HTTPError as e:
+        # Gracefully handle not-found / bad-id edge cases
+        status = getattr(e.response, "status_code", None)
+        if status in (400, 404):
+            user = {"id": user_id, "email": "", "name": "Unknown"}
+        else:
+            raise
     _user_cache[user_id] = user
     return user
+
 
 
 def get_group(group_id: int):
@@ -231,28 +247,39 @@ def ingest(days: int = 5) -> str:
                     continue
 
                 # Comments (to verify human reply and to store the thread)
-                comments = get_comments(tid)
-                has_human_reply = False
-                public_comments = []
-                for idx, c in enumerate(comments):
-                    au = get_user(c.get("author_id"))
-                    a_email = (au.get("email") or "").lower()
-                    a_name = au.get("name") or ""
-                    body = c.get("html_body") or c.get("body") or ""
-                    public = bool(c.get("public", False))
+comments = get_comments(tid)
+has_human_reply = False
+public_comments = []
 
-                    public_comments.append(
-                        (
-                            tid,              # ticket_id
-                            idx,              # idx
-                            c.get("created_at"),
-                            1 if public else 0,
-                            c.get("author_id"),
-                            a_email,
-                            a_name,
-                            body,
-                        )
-                    )
+for idx, c in enumerate(comments):
+    author_id = c.get("author_id")
+    au = get_user(author_id)  # returns stub for -1/None/404/400
+    a_email = (au.get("email") or "").lower()
+    a_name = au.get("name") or "Unknown"
+    body = c.get("html_body") or c.get("body") or ""
+    public = bool(c.get("public", False))
+
+    public_comments.append(
+        (
+            tid,              # ticket_id
+            idx,              # idx
+            c.get("created_at"),
+            1 if public else 0,
+            author_id,
+            a_email,
+            a_name,
+            body,
+        )
+    )
+
+    # Human agent public reply (not requester, not bot, and has an email)
+    if public and a_email and (a_email not in BOT_EMAILS) and (a_email != requester_email):
+        has_human_reply = True
+
+# If no human reply, skip (bot-only)
+if not has_human_reply:
+    continue
+
 
                     # Human agent public reply (not the requester, not a bot)
                     if public and a_email not in BOT_EMAILS and a_email != requester_email:
