@@ -1,6 +1,8 @@
 import os
 import time
 from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
+
 import requests
 
 # ─────────── Read credentials (env first, then Streamlit Secrets) ─────────── #
@@ -8,7 +10,8 @@ SUBDOMAIN = os.getenv("ZD_SUBDOMAIN")
 EMAIL = os.getenv("ZD_EMAIL")
 TOKEN = os.getenv("ZD_API_TOKEN")
 try:
-    import streamlit as st  # optional; only used to read secrets if present
+    # Only used if running on Streamlit Cloud; harmless locally.
+    import streamlit as st
     SUBDOMAIN = SUBDOMAIN or st.secrets.get("ZD_SUBDOMAIN")
     EMAIL = EMAIL or st.secrets.get("ZD_EMAIL")
     TOKEN = TOKEN or st.secrets.get("ZD_API_TOKEN")
@@ -25,17 +28,18 @@ from db import (
     rebuild_fts,
 )
 
-# ───────────────────────────────── Helpers ───────────────────────────────── #
 
-def _base():
+# ───────────────────────────── HTTP helpers ───────────────────────────── #
+
+def _base() -> str:
     if not SUBDOMAIN or not EMAIL or not TOKEN:
         raise SystemExit("Missing Zendesk credentials (set in Streamlit Secrets or env).")
     return f"https://{SUBDOMAIN}.zendesk.com/api/v2"
 
 
-def get_json(url, params=None):
+def get_json(url: str, params: Optional[Dict] = None) -> Dict:
     """
-    GET with retry/backoff. Handles 429 rate limits.
+    GET with retry/backoff. Handles 429 rate limits; raises for other 4xx/5xx.
     """
     backoff = 2
     for _ in range(7):
@@ -45,23 +49,24 @@ def get_json(url, params=None):
             time.sleep(sleep_for)
             backoff = min(backoff * 2, 60)
             continue
-        # Raise for any other 4xx/5xx
         r.raise_for_status()
-        return r.json()
+        return r.json() or {}
     raise RuntimeError("Too many retries (Zendesk API rate limit).")
 
 
-# Simple caches to cut API calls
-_user_cache = {}
+# ───────────────────────────── Caches ───────────────────────────── #
 
-def get_user(user_id: int):
+_user_cache: Dict[int, Dict] = {}
+_group_cache: Dict[int, Dict] = {}
+
+
+def get_user(user_id: Optional[int]) -> Dict:
     """
     Safe user fetch:
-    - Return a stub for system/unknown authors (user_id <= 0 or None)
-    - Swallow 400/404 and return a stub
-    - Cache to reduce API calls
+      - Return a stub for system/unknown authors (user_id <= 0 or None)
+      - Swallow 400/404 and return a stub
+      - Cache to reduce API calls
     """
-    # Stub for system/unknown/deleted
     if not user_id or (isinstance(user_id, int) and user_id <= 0):
         return {"id": user_id, "email": "", "name": "Unknown"}
 
@@ -72,7 +77,6 @@ def get_user(user_id: int):
         data = get_json(f"{_base()}/users/{user_id}.json")
         user = data.get("user", {}) or {"id": user_id, "email": "", "name": "Unknown"}
     except requests.HTTPError as e:
-        # Gracefully handle not-found / bad-id edge cases
         status = getattr(e.response, "status_code", None)
         if status in (400, 404):
             user = {"id": user_id, "email": "", "name": "Unknown"}
@@ -82,32 +86,28 @@ def get_user(user_id: int):
     return user
 
 
-
-def get_group(group_id: int):
-    """
-    GET /groups/{id}.json
-    """
+def get_group(group_id: int) -> Dict:
     if group_id in _group_cache:
         return _group_cache[group_id]
     data = get_json(f"{_base()}/groups/{group_id}.json")
-    grp = data.get("group", {})
+    grp = data.get("group", {}) or {}
     _group_cache[group_id] = grp
     return grp
 
 
-def get_user_group_names(user_id: int):
+def get_user_group_names(user_id: int) -> List[str]:
     """
     GET /group_memberships.json?user_id=...
     Return list of group names the user belongs to.
     """
-    names = []
+    names: List[str] = []
     data = get_json(f"{_base()}/group_memberships.json", params={"user_id": user_id})
     for gm in data.get("group_memberships", []):
         gid = gm.get("group_id")
         if not gid:
             continue
         try:
-            g = get_group(gid)
+            g = get_group(int(gid))
             name = g.get("name") or ""
             if name:
                 names.append(name)
@@ -117,7 +117,7 @@ def get_user_group_names(user_id: int):
     return names
 
 
-def infer_bpo_from_groups(group_names):
+def infer_bpo_from_groups(group_names: List[str]) -> Optional[str]:
     """
     Map assignee's groups to BPO label.
     Adjust rules to match your Zendesk group naming.
@@ -132,28 +132,21 @@ def infer_bpo_from_groups(group_names):
     return None
 
 
-def get_ticket(ticket_id: int):
-    """
-    GET /tickets/{id}.json
-    """
-    return get_json(f"{_base()}/tickets/{ticket_id}.json").get("ticket", {})
+# ───────────────────────────── Ticket endpoints ───────────────────────────── #
+
+def get_ticket(ticket_id: int) -> Dict:
+    return get_json(f"{_base()}/tickets/{ticket_id}.json").get("ticket", {}) or {}
 
 
-def get_comments(ticket_id: int):
-    """
-    GET /tickets/{id}/comments.json
-    """
-    return get_json(f"{_base()}/tickets/{ticket_id}/comments.json").get("comments", [])
+def get_comments(ticket_id: int) -> List[Dict]:
+    return get_json(f"{_base()}/tickets/{ticket_id}/comments.json").get("comments", []) or []
 
 
-def get_audits(ticket_id: int):
-    """
-    GET /tickets/{id}/audits.json
-    """
-    return get_json(f"{_base()}/tickets/{ticket_id}/audits.json").get("audits", [])
+def get_audits(ticket_id: int) -> List[Dict]:
+    return get_json(f"{_base()}/tickets/{ticket_id}/audits.json").get("audits", []) or []
 
 
-def extract_custom_field(ticket: dict, name: str):
+def extract_custom_field(ticket: Dict, name: str):
     """
     Pull a custom field by id from config.CUSTOM_FIELDS mapping.
     """
@@ -166,7 +159,7 @@ def extract_custom_field(ticket: dict, name: str):
     return None
 
 
-def search_ticket_ids(start_dt, end_dt):
+def search_ticket_ids(start_dt: datetime, end_dt: datetime):
     """
     Use Search API to find solved tickets updated in [start_dt, end_dt) window.
     IMPORTANT: Zendesk Search requires timestamps without microseconds and with 'Z' (UTC).
@@ -191,7 +184,7 @@ def search_ticket_ids(start_dt, end_dt):
         url, params = next_page, None
 
 
-# ───────────────────────────────── Ingest ───────────────────────────────── #
+# ───────────────────────────── Ingest main ───────────────────────────── #
 
 def ingest(days: int = 5) -> str:
     """
@@ -205,7 +198,7 @@ def ingest(days: int = 5) -> str:
     """
     init_db()
 
-        # NEW: writer-side timeout hint (extra safety; db.py already sets pragmas)
+    # Extra safety: ensure writer waits if readers are active
     with get_conn() as _conn:
         _conn.execute("PRAGMA busy_timeout=5000;")
 
@@ -228,7 +221,7 @@ def ingest(days: int = 5) -> str:
                 seen.add(tid)
 
                 # Ticket core
-                t = get_ticket(tid)
+                t = get_ticket(int(tid))
                 assignee_id = t.get("assignee_id")
                 if not assignee_id:
                     # Unassigned → skip
@@ -240,50 +233,49 @@ def ingest(days: int = 5) -> str:
 
                 assignee = get_user(assignee_id)
                 assignee_email = (assignee.get("email") or "").lower()
-                assignee_name = assignee.get("name") or ""
+                assignee_name = assignee.get("name") or "Unknown"
 
                 # Skip bot-assigned
                 if assignee_email in BOT_EMAILS:
                     continue
 
                 # Comments (to verify human reply and to store the thread)
-comments = get_comments(tid)
-has_human_reply = False
-public_comments = []
+                comments = get_comments(int(tid))
+                has_human_reply = False
+                public_comments = []
 
-for idx, c in enumerate(comments):
-    author_id = c.get("author_id")
-    au = get_user(author_id)  # safe fetch
-    a_email = (au.get("email") or "").lower()
-    a_name = au.get("name") or "Unknown"
-    body = c.get("html_body") or c.get("body") or ""
-    public = bool(c.get("public", False))
+                for idx, c in enumerate(comments):
+                    author_id = c.get("author_id")
+                    au = get_user(author_id)  # safe fetch (handles -1/None/404/400)
+                    a_email = (au.get("email") or "").lower()
+                    a_name = au.get("name") or "Unknown"
+                    body = c.get("html_body") or c.get("body") or ""
+                    public = bool(c.get("public", False))
 
-    public_comments.append(
-        (
-            tid,              # ticket_id
-            idx,              # comment index
-            c.get("created_at"),
-            1 if public else 0,
-            author_id,
-            a_email,
-            a_name,
-            body,
-        )
-    )
+                    public_comments.append(
+                        (
+                            int(tid),            # ticket_id
+                            idx,                 # comment index
+                            c.get("created_at"),
+                            1 if public else 0,
+                            author_id,
+                            a_email,
+                            a_name,
+                            body,
+                        )
+                    )
 
-    # Human agent public reply (not requester, not bot, has email)
-    if public and a_email and (a_email not in BOT_EMAILS) and (a_email != requester_email):
-        has_human_reply = True
+                    # Human agent public reply (not requester, not bot, has email)
+                    if public and a_email and (a_email not in BOT_EMAILS) and (a_email != requester_email):
+                        has_human_reply = True
 
-# If no human reply, skip (bot-only)
-if not has_human_reply:
-    continue
+                # If no human reply, skip (bot-only)
+                if not has_human_reply:
+                    continue
 
-
-                # Audits → capture macro titles if applied
-                macro_titles = []
-                for a in get_audits(tid):
+                # Audits → capture macro titles if applied (latest)
+                macro_titles: List[str] = []
+                for a in get_audits(int(tid)):
                     for e in a.get("events", []):
                         if e.get("type") == "ApplyMacro":
                             title = e.get("value") or e.get("macro_title")
@@ -291,7 +283,7 @@ if not has_human_reply:
                                 macro_titles.append(title)
 
                 # Derive BPO from groups
-                group_names = get_user_group_names(assignee_id)
+                group_names = get_user_group_names(int(assignee_id))
                 bpo = infer_bpo_from_groups(group_names)
 
                 # Flatten tags
@@ -312,7 +304,7 @@ if not has_human_reply:
                     assignee_id,
                     assignee_email,
                     assignee_name,
-                    bpo,  # <— derived from groups
+                    bpo,  # derived from groups
                     extract_custom_field(t, "payer_tier"),
                     extract_custom_field(t, "language"),
                     extract_custom_field(t, "topic"),
@@ -328,7 +320,7 @@ if not has_human_reply:
 
                 # Store audits (one row per audit timestamp)
                 if macro_titles:
-                    upsert_audit(conn, (tid, t.get("updated_at"), "|".join(macro_titles)))
+                    upsert_audit(conn, (int(tid), t.get("updated_at"), "|".join(macro_titles)))
 
             cursor = window_end
 
