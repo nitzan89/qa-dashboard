@@ -8,18 +8,16 @@ from utils import match_keywords
 from config import DEFAULT_EXCLUDED_TAGS
 import ingest as ingest_mod
 
-
 # ───────────────────────────── Setup ───────────────────────────── #
 st.set_page_config(page_title="QA Ticket Finder", layout="wide")
 st.title("QA Ticket Finder")
 
-# Gate concurrent work (avoid “database is locked” during ingest)
+# Avoid “database is locked” during ingest
 if "ingesting" not in st.session_state:
     st.session_state.ingesting = False
 
-# HTML stripper for keyword search
+# HTML stripper for keyword search & subject fallback
 TAG_RE = re.compile(r"<[^>]+>")
-
 def strip_html(x: str) -> str:
     if not x:
         return ""
@@ -66,9 +64,9 @@ with c4:
     if load_clicked:
         st.session_state.ingesting = True
         try:
-            days = max(1, (today - start_date).days + 1)
-            with st.spinner(f"Fetching last {days} day(s) from Zendesk…"):
-                msg = ingest_mod.ingest(days=days)
+            # Keep ingest simple & reliable: always load last 5 days.
+            with st.spinner("Fetching last 5 day(s) from Zendesk…"):
+                msg = ingest_mod.ingest(days=5)
             st.toast(msg, icon="✅")
         finally:
             st.session_state.ingesting = False
@@ -88,7 +86,6 @@ with st.expander("Advanced filters (optional)", expanded=False):
     if st.button("Rebuild Text Index (FTS)"):
         rebuild_fts()
         st.success("FTS rebuilt.")
-
 
 # If a write is running, stop early to avoid locks
 if st.session_state.ingesting:
@@ -124,7 +121,8 @@ df["id"] = pd.to_numeric(df["id"], errors="coerce").astype("Int64")
 df["csat"] = pd.to_numeric(df["csat"], errors="coerce")
 df["updated_at_dt"] = pd.to_datetime(df["updated_at"], errors="coerce", utc=True).dt.tz_convert(None)
 
-# Date window filter
+# Date window filter (calendar day window for presets)
+# If you prefer rolling 24h, we can switch this to now - 24h.
 start_dt = datetime.combine(start_date, datetime.min.time())
 end_dt = datetime.combine(end_date, datetime.max.time())
 df = df[(df["updated_at_dt"] >= start_dt) & (df["updated_at_dt"] <= end_dt)]
@@ -166,8 +164,22 @@ with get_conn() as conn:
                 }
             )
 
+# Subject fallback: use first public comment if subject missing/“None”
+def subject_for_ticket(tid: int) -> str:
+    subj = (df.loc[df["id"] == tid, "subject"].values[0] or "").strip()
+    if subj and subj.lower() != "none":
+        return subj
+    for c in comments_map.get(int(tid), []):
+        if c["public"]:
+            snippet = strip_html(c.get("body") or "").strip()
+            if snippet:
+                return (snippet[:110] + "…") if len(snippet) > 110 else snippet
+    return "[no subject]"
 
-# ───────────── Stronger filters (tags + HTML-aware keywords) ───────────── #
+df["subject_clean"] = df["id"].apply(lambda x: subject_for_ticket(int(x)))
+
+
+# ───────────── Strong filters (tags + HTML-aware keywords) ───────────── #
 def split_tags(s: str):
     if not s:
         return []
@@ -181,22 +193,17 @@ def split_tags(s: str):
     return [x.lower() for x in out if x]
 
 inc_tags = set(split_tags(include_tags))
-# user-specified excludes (editable field)
 user_exc_tags = set(split_tags(exclude_tags_input))
-# default blacklist from config
 default_exc = set(t.lower() for t in DEFAULT_EXCLUDED_TAGS)
 
 def tags_ok(tag_string: str) -> bool:
     tags = [t.strip().lower() for t in (tag_string or "").split(",") if t.strip()]
     tagset = set(tags)
 
-    # default blacklist first
     if apply_default_exclusions and (tagset & default_exc):
         return False
-    # user excludes
     if user_exc_tags and (tagset & user_exc_tags):
         return False
-    # user includes (ANY)
     if inc_tags and not (tagset & inc_tags):
         return False
     return True
@@ -213,7 +220,7 @@ inc_kw_list = parse_kw_list(include_kw)
 exc_kw_list = parse_kw_list(exclude_kw)
 
 def text_for_search(tid):
-    sub = (df.loc[df["id"] == tid, "subject"].values[0] or "")
+    sub = df.loc[df["id"] == tid, "subject_clean"].values[0] or ""
     bodies = [c["body"] for c in comments_map.get(int(tid), []) if c["public"]]
     text = " \n ".join([sub] + bodies)
     return strip_html(text)
@@ -266,14 +273,18 @@ df["ticket_url"] = df["id"].apply(
 )
 
 display_cols = [
-    "id_str", "subject", "assignee_name", "bpo", "csat", "payer_tier",
+    "id_str", "subject_clean", "assignee_name", "bpo", "csat", "payer_tier",
     "topic", "sub_topic", "macros_used", "ticket_url"
 ]
 df_view = df[display_cols].rename(columns={
     "id_str": "ZD #",
+    "subject_clean": "Subject",
     "ticket_url": "Open",
-    "macros_used": "Macros"
+    "macros_used": "Macros",
 })
+
+# Render tidy dashes instead of None/NaN/empty strings
+df_view = df_view.fillna("—").replace({"": "—", "None": "—", None: "—"})
 
 st.subheader("Tickets")
 st.caption("Filtered list. Click **Open** to view in Zendesk. Pick a subject to preview the thread below.")
@@ -284,7 +295,7 @@ st.dataframe(
     hide_index=True,
     column_config={
         "Open": st.column_config.LinkColumn("Open", help="Open in Zendesk"),
-        "subject": st.column_config.TextColumn("Subject"),
+        "Subject": st.column_config.TextColumn("Subject"),
         "assignee_name": st.column_config.TextColumn("Assignee"),
         "bpo": st.column_config.TextColumn("BPO"),
         "csat": st.column_config.NumberColumn("CSAT"),
@@ -295,10 +306,9 @@ st.dataframe(
     },
 )
 
-
-# ───────────── Subject picker → preview (chat style) ───────────── #
+# Subject picker → preview
 subject_options = (
-    df.assign(label=lambda d: d["subject"].fillna("").replace("", "[no subject]") + "  ·  ZD #" + d["id_str"])
+    df.assign(label=lambda d: d["subject_clean"].fillna("[no subject]") + "  ·  ZD #" + d["id_str"])
       .loc[:, ["id", "label"]]
       .dropna()
       .values.tolist()
@@ -324,7 +334,7 @@ if selected_id is None:
 
 trow = df[df["id"] == selected_id].iloc[0]
 zd_link = f"https://candivore.zendesk.com/agent/tickets/{selected_id}"
-st.markdown(f"### {trow['subject'] or '[no subject]'}  ·  ZD #{selected_id}  ·  [Open]({zd_link})")
+st.markdown(f"### {trow['subject_clean']}  ·  ZD #{selected_id}  ·  [Open]({zd_link})")
 st.caption(
     f"Assignee: {trow['assignee_name']}  |  BPO: {trow['bpo']}  |  CSAT: {trow['csat']}  |  "
     f"Payer tier: {trow['payer_tier']}"
@@ -339,13 +349,11 @@ else:
         role = "user" if is_requester else "assistant"
         name = c["author_name"] or ("Requester" if is_requester else "Agent")
         ts = c["created_at"] or ""
-
         with st.chat_message(role):
             st.markdown(f"**{name}** · {ts}")
             st.markdown(c.get("body") or "", unsafe_allow_html=True)
 
-
-# ───────────── Export ───────────── #
+# Export
 if st.button("Export CSV"):
     out = df_view.to_csv(index=False)
     st.download_button("Download filtered.csv", data=out, file_name="filtered.csv", mime="text/csv")
