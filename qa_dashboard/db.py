@@ -7,11 +7,18 @@ def get_conn():
     try: yield conn
     finally:
         conn.commit(); conn.close()
+        
 def init_db():
+    import os
     from pathlib import Path
+    from config import DB_PATH
+    schema_path = os.path.join(os.path.dirname(__file__), "schema.sql")
+
     Path(os.path.dirname(DB_PATH)).mkdir(parents=True, exist_ok=True)
-    with get_conn() as conn, open("schema.sql","r") as f:
+    with get_conn() as conn, open(schema_path, "r", encoding="utf-8") as f:
         conn.executescript(f.read())
+
+
 def upsert_ticket(conn, t):
     conn.execute(
         "INSERT INTO tickets (id,status,subject,created_at,updated_at,solved_at,csat,csat_offered,requester_id,requester_email,assignee_id,assignee_email,assignee_name,bpo,payer_tier,language,topic,sub_topic,version,tags) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
