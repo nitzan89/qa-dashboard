@@ -18,17 +18,28 @@ def get_json(url, params=None):
             time.sleep(int(r.headers.get("Retry-After","2"))); continue
         r.raise_for_status(); return r.json()
     raise RuntimeError("Too many retries / rate-limited")
-def search_ticket_ids(start,end):
-    q=f'status:solved updated>="{start.isoformat()}" updated<"{end.isoformat()}"'
-    url=f"{BASE()}/search.json"; params={"query":q,"page":1}
+
+def search_ticket_ids(start, end):
+    # Format in ISO8601 without microseconds and with Z for UTC
+    start_str = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_str = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    q = f'status:solved updated>="{start_str}" updated<"{end_str}"'
+    url = f"{BASE()}/search.json"
+    params = {"query": q, "page": 1}
+
     while True:
-        data=get_json(url, params=params)
-        for r in data.get("results",[]):
-            if r.get("result_type")=="ticket": yield r["id"]
-        nextp=data.get("next_page"); 
-        if not nextp: break
-        url,params=nextp,None
-_user_cache={}
+        data = get_json(url, params=params)
+        for r in data.get("results", []):
+            if r.get("result_type") == "ticket":
+                yield r["id"]
+
+        nextp = data.get("next_page")
+        if not nextp:
+            break
+        url, params = nextp, None
+
+
 def get_user(uid):
     if uid in _user_cache: return _user_cache[uid]
     data=get_json(f"{BASE()}/users/{uid}.json"); user=data["user"]; _user_cache[uid]=user; return user
