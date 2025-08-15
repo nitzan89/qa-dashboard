@@ -1,13 +1,22 @@
-import pandas as pd, streamlit as st
+import pandas as pd
+import streamlit as st
+
 from config import DEFAULT_EXCLUDED_TAGS, SENSITIVE_KEYWORDS, DEFAULT_WEIGHTS
 from db import get_conn, rebuild_fts, init_db
 from utils import match_keywords, highlight
-from scoring import score_ticket, empathy_markers_in_reply, personalization_overlap, is_complaint
+from scoring import (
+    score_ticket,
+    empathy_markers_in_reply,
+    personalization_overlap,
+    is_complaint,
+)
 import ingest as ingest_mod
 
-st.set_page_config(page_title="QA-Worthy Dashboard", layout="wide")
+
+st.set_page_config(page_title="QA-Worthy Ticket Dashboard", layout="wide")
 st.title("QA-Worthy Ticket Dashboard")
 
+# ───────────────────────── Sidebar ───────────────────────── #
 with st.sidebar:
     st.header("Data")
     if st.button("Refresh data (pull last 5 days)"):
@@ -18,77 +27,123 @@ with st.sidebar:
 
 st.sidebar.header("Filters")
 days = st.sidebar.slider("Solved in last N days", 1, 5, 5)
+
 include_tags = st.sidebar.text_input("Include tags (comma-separated)", "")
-exclude_tags = st.sidebar.text_input("Exclude tags (comma-separated)", ",".join(DEFAULT_EXCLUDED_TAGS))
+exclude_tags = st.sidebar.text_input(
+    "Exclude tags (comma-separated)", ",".join(DEFAULT_EXCLUDED_TAGS)
+)
 
 st.sidebar.subheader("Keyword filters")
-kw_mode = st.sidebar.selectbox("Include mode", ["any","all","phrase","regex"], index=0)
+kw_mode = st.sidebar.selectbox("Include mode", ["any", "all", "phrase", "regex"], index=0)
 include_kw = st.sidebar.text_area("Include keywords (one per line)", "")
 exclude_kw = st.sidebar.text_area("Exclude keywords (one per line)", "")
 
 st.sidebar.subheader("Sensitive keyword pack")
-sensitive_pack = st.sidebar.text_input("Sensitive keywords (comma-separated)", ",".join(SENSITIVE_KEYWORDS))
+sensitive_pack = st.sidebar.text_input(
+    "Sensitive keywords (comma-separated)", ",".join(SENSITIVE_KEYWORDS)
+)
 
 st.sidebar.subheader("Weights")
 weights = {}
-for k,v in DEFAULT_WEIGHTS.items():
+for k, v in DEFAULT_WEIGHTS.items():
     weights[k] = st.sidebar.number_input(k, value=float(v))
 
 if st.sidebar.button("Rebuild Text Index (FTS)"):
-    rebuild_fts(); st.sidebar.success("FTS rebuilt.")
+    rebuild_fts()
+    st.sidebar.success("FTS rebuilt.")
 
+# ─────────────────────── Load from DB ────────────────────── #
 init_db()
 
 with get_conn() as conn:
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(
+        """
         SELECT id, status, subject, created_at, updated_at, solved_at, csat, csat_offered,
-               requester_email, assignee_email, assignee_name, bpo, payer_tier, language, topic, sub_topic, version, tags
+               requester_email, assignee_email, assignee_name, bpo, payer_tier,
+               language, topic, sub_topic, version, tags
         FROM tickets
         WHERE datetime(updated_at) >= datetime('now', ?)
         ORDER BY updated_at DESC
-    """, (f'-{days} days',))
+        """,
+        (f"-{days} days",),
+    )
     rows = cur.fetchall()
 
-
-# If there are no rows yet (fresh DB), stop before we touch df["id"]
-cols = ["id","status","subject","created_at","updated_at","solved_at","csat","csat_offered",
-        "requester_email","assignee_email","assignee_name","bpo","payer_tier","language","topic","sub_topic","version","tags"]
+cols = [
+    "id",
+    "status",
+    "subject",
+    "created_at",
+    "updated_at",
+    "solved_at",
+    "csat",
+    "csat_offered",
+    "requester_email",
+    "assignee_email",
+    "assignee_name",
+    "bpo",
+    "payer_tier",
+    "language",
+    "topic",
+    "sub_topic",
+    "version",
+    "tags",
+]
 df = pd.DataFrame(rows, columns=cols)
 
+# Normalize types we care about
+df["csat"] = pd.to_numeric(df["csat"], errors="coerce")  # may be NaN
+
+# Early exit on empty DB
 if df.empty:
     st.warning("No tickets yet. Click **Refresh data (pull last 5 days)** in the sidebar.")
     st.stop()
 
-cols = ["id","status","subject","created_at","updated_at","solved_at","csat","csat_offered",
-        "requester_email","assignee_email","assignee_name","bpo","payer_tier","language","topic","sub_topic","version","tags"]
-df = pd.DataFrame(rows, columns=cols)
-
-df["csat"] = pd.to_numeric(df["csat"], errors="coerce")  # -> NaN if not numeric
-
-
+# ───────────────────── Tag + keyword filters ───────────────────── #
 inc_tags = [t.strip() for t in include_tags.split(",") if t.strip()]
 exc_tags = [t.strip() for t in exclude_tags.split(",") if t.strip()]
 
 def tags_ok(tag_string: str) -> bool:
     tags = (tag_string or "").split(",")
-    if inc_tags and not any(t in tags for t in inc_tags): return False
-    if exc_tags and any(t in tags for t in exc_tags): return False
+    if inc_tags and not any(t in tags for t in inc_tags):
+        return False
+    if exc_tags and any(t in tags for t in exc_tags):
+        return False
     return True
 
 df = df[df["tags"].apply(tags_ok)]
 
+# Build comments map for keyword search + preview
 ticket_ids = df["id"].tolist()
 comments_map = {}
 with get_conn() as conn:
     cur = conn.cursor()
     if ticket_ids:
-        q = ",".join("?" for _ in ticket_ids)
-        cur.execute(f"SELECT ticket_id, idx, created_at, public, author_email, author_name, body FROM comments WHERE ticket_id IN ({q}) ORDER BY ticket_id, idx ASC", ticket_ids)
+        q_marks = ",".join("?" for _ in ticket_ids)
+        cur.execute(
+            f"""
+            SELECT ticket_id, idx, created_at, public, author_email, author_name, body
+            FROM comments
+            WHERE ticket_id IN ({q_marks})
+            ORDER BY ticket_id, idx ASC
+            """,
+            ticket_ids,
+        )
         for row in cur.fetchall():
             tid = row[0]
-            comments_map.setdefault(tid, []).append({"idx": row[1], "created_at": row[2], "public": bool(row[3]), "author_email": row[4] or "", "author_name": row[5] or "", "body": row[6] or ""})
+            comments_map.setdefault(tid, []).append(
+                {
+                    "idx": row[1],
+                    "created_at": row[2],
+                    "public": bool(row[3]),
+                    "author_email": row[4] or "",
+                    "author_name": row[5] or "",
+                    "body": row[6] or "",
+                }
+            )
 
+# Keyword filters
 inc_kw_list = [k.strip() for k in include_kw.splitlines() if k.strip()]
 exc_kw_list = [k.strip() for k in exclude_kw.splitlines() if k.strip()]
 sensitive_list = [k.strip() for k in sensitive_pack.split(",") if k.strip()]
@@ -100,49 +155,146 @@ def text_for_search(tid):
 
 def passes_keyword_filters(tid):
     text = text_for_search(tid)
-    from utils import match_keywords
-    if inc_kw_list and not match_keywords(text, inc_kw_list, kw_mode): return False
-    if exc_kw_list and match_keywords(text, exc_kw_list, "any"): return False
+    if inc_kw_list and not match_keywords(text, inc_kw_list, kw_mode):
+        return False
+    if exc_kw_list and match_keywords(text, exc_kw_list, "any"):
+        return False
     return True
 
 if inc_kw_list or exc_kw_list:
     df = df[df["id"].apply(passes_keyword_filters)]
 
-from scoring import score_ticket, empathy_markers_in_reply, personalization_overlap, is_complaint
+# ─────────────────────── Scoring & reasons ─────────────────────── #
 scores = []
 for _, t in df.iterrows():
-    tid = int(t["id"]); comments = comments_map.get(tid, [])
-    user_text = " ".join([c["body"] for c in comments if c["public"] and c["author_email"] == t["requester_email"]])
-    agent_replies = [c for c in comments if c["public"] and c["author_email"] != t["requester_email"]]
-    first_agent_reply = agent_replies[0]["body"] if agent_replies else ""
-    cfg = dict(
-        sensitive_hit = any(match_keywords(text_for_search(tid), [s], "any") for s in sensitive_list),
-        is_complaint = is_complaint(user_text),
-        reopened_recently = True,
-        macro_mismatch = False,
-        multi_topic = len((t["tags"] or "").split(",")) > 4,
-        personalization = personalization_overlap(user_text, first_agent_reply),
-        empathy = empathy_markers_in_reply(first_agent_reply),
-        easy_only = set((t["tags"] or "").split(",")).issubset({"connection","connection_issue","lag","crash","game_crash","network","timeout","opp_out_of_time"})
+    tid = int(t["id"])
+    comments = comments_map.get(tid, [])
+    user_text = " ".join(
+        [c["body"] for c in comments if c["public"] and c["author_email"] == t["requester_email"]]
     )
+    agent_replies = [
+        c for c in comments if c["public"] and c["author_email"] != t["requester_email"]
+    ]
+    first_agent_reply = agent_replies[0]["body"] if agent_replies else ""
+
+    cfg = dict(
+        sensitive_hit=any(match_keywords(text_for_search(tid), [s], "any") for s in sensitive_list),
+        is_complaint=is_complaint(user_text),
+        reopened_recently=True,  # approximated via updated_at window
+        macro_mismatch=False,    # placeholder; wire if you map macro titles later
+        multi_topic=len((t["tags"] or "").split(",")) > 4,
+        personalization=personalization_overlap(user_text, first_agent_reply),
+        empathy=empathy_markers_in_reply(first_agent_reply),
+        easy_only=set((t["tags"] or "").split(",")).issubset(
+            {
+                "connection",
+                "connection_issue",
+                "lag",
+                "crash",
+                "game_crash",
+                "network",
+                "timeout",
+                "opp_out_of_time",
+            }
+        ),
+    )
+
     score, reasons = score_ticket(t.to_dict(), comments, DEFAULT_WEIGHTS if not weights else weights, cfg)
     scores.append((tid, score, ", ".join(reasons)))
-score_df = pd.DataFrame(scores, columns=["id","score","reasons"])
+
+score_df = pd.DataFrame(scores, columns=["id", "score", "reasons"])
 df = df.merge(score_df, on="id", how="left").sort_values("score", ascending=False)
 
+# ───────────── Clean ID + click-through link to Zendesk ───────────── #
+df["id"] = pd.to_numeric(df["id"], errors="coerce").astype("Int64")
+df["id_str"] = df["id"].astype(str)  # remove thousands separator formatting
+df["ticket_url"] = df["id"].apply(
+    lambda x: f"https://candivore.zendesk.com/agent/tickets/{int(x)}" if pd.notna(x) else ""
+)
+
+# ───────────────────────── Candidates table ───────────────────────── #
 st.subheader("Candidates")
 st.caption("Ranked by QA-worthiness score. Adjust filters/weights on the left.")
-st.dataframe(df[["id","score","reasons","assignee_name","bpo","csat","payer_tier","topic","sub_topic","tags","updated_at","subject"]], use_container_width=True)
 
+df_view = df.copy().rename(columns={"id_str": "Ticket ID"})
+st.dataframe(
+    df_view[
+        [
+            "id_str",
+            "score",
+            "reasons",
+            "assignee_name",
+            "bpo",
+            "csat",
+            "payer_tier",
+            "topic",
+            "sub_topic",
+            "tags",
+            "updated_at",
+            "subject",
+            "ticket_url",
+        ]
+    ],
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "ticket_url": st.column_config.LinkColumn("Open in Zendesk"),
+        "id_str": st.column_config.TextColumn("Ticket ID"),
+    },
+)
+
+# ─────────────────────────── Preview (chat) ─────────────────────────── #
 st.subheader("Preview")
-sel = st.multiselect("Select ticket IDs to preview", df["id"].tolist()[:20])
-for tid in sel:
-    st.markdown(f"### Ticket #{tid}")
-    trow = df[df["id"] == tid].iloc[0]
-    st.write(f"Assignee: {trow['assignee_name']} | CSAT: {trow['csat']} | Payer tier: {trow['payer_tier']} | Tags: {trow['tags']}")
-    body = text_for_search(tid)
-    st.markdown(highlight(body, inc_kw_list + sensitive_list))
 
+selectable_ids = df["id"].dropna().astype(int).tolist()
+sel = st.multiselect("Select ticket IDs to preview", selectable_ids[:50])
+
+for tid in sel:
+    trow = df[df["id"] == tid].iloc[0]
+    zd_link = f"https://candivore.zendesk.com/agent/tickets/{int(tid)}"
+
+    st.markdown(f"### Ticket #{tid} · [Open in Zendesk]({zd_link})")
+    st.caption(
+        f"Assignee: {trow['assignee_name']}  |  CSAT: {trow['csat']}  |  "
+        f"Payer tier: {trow['payer_tier']}  |  Tags: {trow['tags']}"
+    )
+
+    thread = comments_map.get(int(tid), [])
+    if not thread:
+        st.info("No public comments on this ticket.")
+        continue
+
+    # Render like a conversation
+    for c in thread:
+        is_requester = c["author_email"] == trow["requester_email"]
+        role = "user" if is_requester else "assistant"
+        name = c["author_name"] or ("Requester" if is_requester else "Agent")
+        ts = c["created_at"] or ""
+
+        with st.chat_message(role):
+            st.markdown(f"**{name}** · {ts}")
+            # Zendesk bodies can be HTML — render safely
+            st.markdown(c.get("body") or "", unsafe_allow_html=True)
+
+# ─────────────────────────── Export ─────────────────────────── #
 if st.button("Export CSV"):
-    out = df.to_csv(index=False)
-    st.download_button("Download filtered.csv", data=out, file_name="filtered.csv", mime="text/csv")
+    out = df_view[
+        [
+            "id_str",
+            "score",
+            "reasons",
+            "assignee_name",
+            "bpo",
+            "csat",
+            "payer_tier",
+            "topic",
+            "sub_topic",
+            "tags",
+            "updated_at",
+            "subject",
+            "ticket_url",
+        ]
+    ].to_csv(index=False)
+    st.download_button(
+        "Download filtered.csv", data=out, file_name="filtered.csv", mime="text/csv"
+    )
