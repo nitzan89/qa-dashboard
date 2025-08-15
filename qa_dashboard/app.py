@@ -1,17 +1,30 @@
+import re
 import pandas as pd
 import streamlit as st
 from datetime import date, datetime, timedelta
 
 from db import get_conn, init_db, rebuild_fts
 from utils import match_keywords
+from config import DEFAULT_EXCLUDED_TAGS
 import ingest as ingest_mod
 
+
+# ───────────────────────────── Setup ───────────────────────────── #
 st.set_page_config(page_title="QA Ticket Finder", layout="wide")
 st.title("QA Ticket Finder")
 
-# Gate concurrent work
+# Gate concurrent work (avoid “database is locked” during ingest)
 if "ingesting" not in st.session_state:
     st.session_state.ingesting = False
+
+# HTML stripper for keyword search
+TAG_RE = re.compile(r"<[^>]+>")
+
+def strip_html(x: str) -> str:
+    if not x:
+        return ""
+    return TAG_RE.sub(" ", str(x))
+
 
 # ───────────────────────── Top toolbar ───────────────────────── #
 today = date.today()
@@ -62,21 +75,28 @@ with c4:
 
 with st.expander("Advanced filters (optional)", expanded=False):
     include_tags = st.text_input("Include tags (comma-separated)", "")
-    exclude_tags = st.text_input(
+    exclude_tags_input = st.text_input(
         "Exclude tags (comma-separated)",
-        "connection,connection_issue,lag,crash,game_crash,network,timeout,opp_out_of_time",
+        ",".join(DEFAULT_EXCLUDED_TAGS),
+        help="Starts with your default blacklist; you can edit."
+    )
+    apply_default_exclusions = st.checkbox(
+        "Apply default excluded tags", value=True,
+        help="Uses your standard blacklist (connection, closed_by_merge, swat, etc.)"
     )
     kw_mode = st.selectbox("Keyword match mode", ["any", "all", "phrase", "regex"], index=0)
     if st.button("Rebuild Text Index (FTS)"):
         rebuild_fts()
         st.success("FTS rebuilt.")
 
+
 # If a write is running, stop early to avoid locks
 if st.session_state.ingesting:
     st.info("Fetching data… please wait a moment.")
     st.stop()
 
-# ───────────────────── Load & filter from DB ───────────────────── #
+
+# ───────────────────── Load & base filtering from DB ───────────────────── #
 init_db()
 
 with get_conn() as conn:
@@ -99,12 +119,12 @@ cols = [
 ]
 df = pd.DataFrame(rows, columns=cols)
 
-# Types
+# Normalize types
 df["id"] = pd.to_numeric(df["id"], errors="coerce").astype("Int64")
 df["csat"] = pd.to_numeric(df["csat"], errors="coerce")
 df["updated_at_dt"] = pd.to_datetime(df["updated_at"], errors="coerce", utc=True).dt.tz_convert(None)
 
-# Window filter
+# Date window filter
 start_dt = datetime.combine(start_date, datetime.min.time())
 end_dt = datetime.combine(end_date, datetime.max.time())
 df = df[(df["updated_at_dt"] >= start_dt) & (df["updated_at_dt"] <= end_dt)]
@@ -116,7 +136,8 @@ if df.empty:
     )
     st.stop()
 
-# Build comments map for preview + keyword search
+
+# ───────────── Build comments map (for keywords & preview) ───────────── #
 ticket_ids = df["id"].dropna().astype(int).tolist()
 comments_map = {}
 with get_conn() as conn:
@@ -145,15 +166,38 @@ with get_conn() as conn:
                 }
             )
 
-# Filters (tags + keywords)
-inc_tags = [t.strip() for t in include_tags.split(",") if t.strip()]
-exc_tags = [t.strip() for t in exclude_tags.split(",") if t.strip()]
+
+# ───────────── Stronger filters (tags + HTML-aware keywords) ───────────── #
+def split_tags(s: str):
+    if not s:
+        return []
+    raw = [p.strip() for p in s.split(",")]
+    out = []
+    for p in raw:
+        if " " in p:
+            out.extend([x for x in p.split() if x])
+        elif p:
+            out.append(p)
+    return [x.lower() for x in out if x]
+
+inc_tags = set(split_tags(include_tags))
+# user-specified excludes (editable field)
+user_exc_tags = set(split_tags(exclude_tags_input))
+# default blacklist from config
+default_exc = set(t.lower() for t in DEFAULT_EXCLUDED_TAGS)
 
 def tags_ok(tag_string: str) -> bool:
-    tags = [t for t in (tag_string or "").split(",") if t]
-    if inc_tags and not any(t in tags for t in inc_tags):
+    tags = [t.strip().lower() for t in (tag_string or "").split(",") if t.strip()]
+    tagset = set(tags)
+
+    # default blacklist first
+    if apply_default_exclusions and (tagset & default_exc):
         return False
-    if exc_tags and any(t in tags for t in exc_tags):
+    # user excludes
+    if user_exc_tags and (tagset & user_exc_tags):
+        return False
+    # user includes (ANY)
+    if inc_tags and not (tagset & inc_tags):
         return False
     return True
 
@@ -169,9 +213,10 @@ inc_kw_list = parse_kw_list(include_kw)
 exc_kw_list = parse_kw_list(exclude_kw)
 
 def text_for_search(tid):
-    sub = df.loc[df["id"] == tid, "subject"].values[0] or ""
-    texts = [sub] + [c["body"] for c in comments_map.get(int(tid), []) if c["public"]]
-    return "\n".join(texts)
+    sub = (df.loc[df["id"] == tid, "subject"].values[0] or "")
+    bodies = [c["body"] for c in comments_map.get(int(tid), []) if c["public"]]
+    text = " \n ".join([sub] + bodies)
+    return strip_html(text)
 
 def passes_keyword_filters(tid):
     text = text_for_search(tid)
@@ -188,14 +233,47 @@ if df.empty:
     st.info("No tickets match your filters. Clear filters or change the range.")
     st.stop()
 
-# Pretty table
+
+# ───────────── Optional: latest macros used (from audits) ───────────── #
+macros_map = {}
+with get_conn() as conn:
+    cur = conn.cursor()
+    if ticket_ids:
+        q_marks = ",".join("?" for _ in ticket_ids)
+        cur.execute(
+            f"""
+            SELECT a.ticket_id, a.macro_titles
+            FROM audits a
+            JOIN (
+                SELECT ticket_id, MAX(created_at) AS max_created
+                FROM audits
+                WHERE ticket_id IN ({q_marks})
+                GROUP BY ticket_id
+            ) m
+            ON a.ticket_id = m.ticket_id AND a.created_at = m.max_created
+            """,
+            ticket_ids,
+        )
+        for tid, macros in cur.fetchall():
+            macros_map[int(tid)] = macros or ""
+df["macros_used"] = df["id"].apply(lambda x: macros_map.get(int(x), ""))
+
+
+# ───────────── Pretty table (no tags/dates; short link) ───────────── #
 df["id_str"] = df["id"].astype(str)
 df["ticket_url"] = df["id"].apply(
     lambda x: f"https://candivore.zendesk.com/agent/tickets/{int(x)}" if pd.notna(x) else ""
 )
 
-display_cols = ["id_str", "subject", "assignee_name", "bpo", "csat", "payer_tier", "topic", "sub_topic", "ticket_url"]
-df_view = df[display_cols].rename(columns={"id_str": "ZD #", "ticket_url": "Open"})
+display_cols = [
+    "id_str", "subject", "assignee_name", "bpo", "csat", "payer_tier",
+    "topic", "sub_topic", "macros_used", "ticket_url"
+]
+df_view = df[display_cols].rename(columns={
+    "id_str": "ZD #",
+    "ticket_url": "Open",
+    "macros_used": "Macros"
+})
 
 st.subheader("Tickets")
 st.caption("Filtered list. Click **Open** to view in Zendesk. Pick a subject to preview the thread below.")
@@ -213,10 +291,12 @@ st.dataframe(
         "payer_tier": st.column_config.TextColumn("Payer tier"),
         "topic": st.column_config.TextColumn("Topic"),
         "sub_topic": st.column_config.TextColumn("Sub-topic"),
+        "Macros": st.column_config.TextColumn("Macros"),
     },
 )
 
-# Subject picker -> preview
+
+# ───────────── Subject picker → preview (chat style) ───────────── #
 subject_options = (
     df.assign(label=lambda d: d["subject"].fillna("").replace("", "[no subject]") + "  ·  ZD #" + d["id_str"])
       .loc[:, ["id", "label"]]
@@ -259,11 +339,13 @@ else:
         role = "user" if is_requester else "assistant"
         name = c["author_name"] or ("Requester" if is_requester else "Agent")
         ts = c["created_at"] or ""
+
         with st.chat_message(role):
             st.markdown(f"**{name}** · {ts}")
             st.markdown(c.get("body") or "", unsafe_allow_html=True)
 
-# Export
+
+# ───────────── Export ───────────── #
 if st.button("Export CSV"):
     out = df_view.to_csv(index=False)
     st.download_button("Download filtered.csv", data=out, file_name="filtered.csv", mime="text/csv")
