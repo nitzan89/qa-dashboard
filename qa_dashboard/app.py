@@ -64,6 +64,9 @@ cols = ["id","status","subject","created_at","updated_at","solved_at","csat","cs
         "requester_email","assignee_email","assignee_name","bpo","payer_tier","language","topic","sub_topic","version","tags"]
 df = pd.DataFrame(rows, columns=cols)
 
+df["csat"] = pd.to_numeric(df["csat"], errors="coerce")  # -> NaN if not numeric
+
+
 inc_tags = [t.strip() for t in include_tags.split(",") if t.strip()]
 exc_tags = [t.strip() for t in exclude_tags.split(",") if t.strip()]
 
