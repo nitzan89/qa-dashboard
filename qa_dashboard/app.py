@@ -3,12 +3,15 @@ import streamlit as st
 from datetime import date, datetime, timedelta
 
 from db import get_conn, init_db, rebuild_fts
-from utils import match_keywords, highlight
+from utils import match_keywords
 import ingest as ingest_mod
-
 
 st.set_page_config(page_title="QA Ticket Finder", layout="wide")
 st.title("QA Ticket Finder")
+
+# Gate concurrent work
+if "ingesting" not in st.session_state:
+    st.session_state.ingesting = False
 
 # ───────────────────────── Top toolbar ───────────────────────── #
 today = date.today()
@@ -30,7 +33,6 @@ with c2:
         if isinstance(dr, tuple):
             start_date, end_date = dr
         else:
-            # fallback for single date selection
             start_date, end_date = default_start, today
     else:
         start_map = {
@@ -39,7 +41,6 @@ with c2:
             "Last 5 days": today - timedelta(days=5),
         }
         start_date, end_date = start_map[preset], today
-    # ensure ordering
     if start_date > end_date:
         start_date, end_date = end_date, start_date
 
@@ -48,15 +49,16 @@ with c3:
     exclude_kw = st.text_input("Exclude keywords", "")
 
 with c4:
-    if st.button("🔄 Load tickets"):
-        # Pull from Zendesk for the window [start_date .. today]
-        days = max(1, (today - start_date).days + 1)
-        with st.spinner(f"Fetching last {days} day(s) from Zendesk…"):
-            msg = ingest_mod.ingest(days=days)
-        st.toast(msg, icon="✅")
-        st.session_state.last_loaded_days = days
-        st.session_state.window_start = str(start_date)
-        st.session_state.window_end = str(end_date)
+    load_clicked = st.button("🔄 Load tickets", disabled=st.session_state.ingesting)
+    if load_clicked:
+        st.session_state.ingesting = True
+        try:
+            days = max(1, (today - start_date).days + 1)
+            with st.spinner(f"Fetching last {days} day(s) from Zendesk…"):
+                msg = ingest_mod.ingest(days=days)
+            st.toast(msg, icon="✅")
+        finally:
+            st.session_state.ingesting = False
 
 with st.expander("Advanced filters (optional)", expanded=False):
     include_tags = st.text_input("Include tags (comma-separated)", "")
@@ -69,10 +71,14 @@ with st.expander("Advanced filters (optional)", expanded=False):
         rebuild_fts()
         st.success("FTS rebuilt.")
 
+# If a write is running, stop early to avoid locks
+if st.session_state.ingesting:
+    st.info("Fetching data… please wait a moment.")
+    st.stop()
+
 # ───────────────────── Load & filter from DB ───────────────────── #
 init_db()
 
-# Load the raw tickets from DB; we’ll filter by the chosen window next.
 with get_conn() as conn:
     cur = conn.cursor()
     cur.execute(
@@ -98,13 +104,11 @@ df["id"] = pd.to_numeric(df["id"], errors="coerce").astype("Int64")
 df["csat"] = pd.to_numeric(df["csat"], errors="coerce")
 df["updated_at_dt"] = pd.to_datetime(df["updated_at"], errors="coerce", utc=True).dt.tz_convert(None)
 
-# Window filter (use the chosen date range)
+# Window filter
 start_dt = datetime.combine(start_date, datetime.min.time())
 end_dt = datetime.combine(end_date, datetime.max.time())
-
 df = df[(df["updated_at_dt"] >= start_dt) & (df["updated_at_dt"] <= end_dt)]
 
-# Early prompts for common confusion
 if df.empty:
     st.warning(
         "No tickets in the selected window. Click **Load tickets** to fetch, "
@@ -141,7 +145,7 @@ with get_conn() as conn:
                 }
             )
 
-# ───────────────────── Filters (tags + keywords) ───────────────────── #
+# Filters (tags + keywords)
 inc_tags = [t.strip() for t in include_tags.split(",") if t.strip()]
 exc_tags = [t.strip() for t in exclude_tags.split(",") if t.strip()]
 
@@ -184,23 +188,13 @@ if df.empty:
     st.info("No tickets match your filters. Clear filters or change the range.")
     st.stop()
 
-# ───────────────────── Pretty table (no tags/dates) ───────────────────── #
+# Pretty table
 df["id_str"] = df["id"].astype(str)
 df["ticket_url"] = df["id"].apply(
     lambda x: f"https://candivore.zendesk.com/agent/tickets/{int(x)}" if pd.notna(x) else ""
 )
 
-display_cols = [
-    "id_str",          # ZD #
-    "subject",
-    "assignee_name",
-    "bpo",
-    "csat",
-    "payer_tier",
-    "topic",
-    "sub_topic",
-    "ticket_url",      # Open link
-]
+display_cols = ["id_str", "subject", "assignee_name", "bpo", "csat", "payer_tier", "topic", "sub_topic", "ticket_url"]
 df_view = df[display_cols].rename(columns={"id_str": "ZD #", "ticket_url": "Open"})
 
 st.subheader("Tickets")
@@ -222,7 +216,7 @@ st.dataframe(
     },
 )
 
-# Subject picker (acts like “click subject to preview”)
+# Subject picker -> preview
 subject_options = (
     df.assign(label=lambda d: d["subject"].fillna("").replace("", "[no subject]") + "  ·  ZD #" + d["id_str"])
       .loc[:, ["id", "label"]]
@@ -239,7 +233,6 @@ selected_label = st.selectbox(
 
 selected_id = None
 if subject_options:
-    # reverse-lookup id by label
     for tid, lbl in subject_options:
         if lbl == selected_label:
             selected_id = int(tid)
@@ -249,7 +242,6 @@ if selected_id is None:
     st.info("No ticket selected.")
     st.stop()
 
-# Render preview like a conversation
 trow = df[df["id"] == selected_id].iloc[0]
 zd_link = f"https://candivore.zendesk.com/agent/tickets/{selected_id}"
 st.markdown(f"### {trow['subject'] or '[no subject]'}  ·  ZD #{selected_id}  ·  [Open]({zd_link})")
@@ -267,7 +259,6 @@ else:
         role = "user" if is_requester else "assistant"
         name = c["author_name"] or ("Requester" if is_requester else "Agent")
         ts = c["created_at"] or ""
-
         with st.chat_message(role):
             st.markdown(f"**{name}** · {ts}")
             st.markdown(c.get("body") or "", unsafe_allow_html=True)
