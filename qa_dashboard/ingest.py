@@ -19,6 +19,8 @@ def get_json(url, params=None):
         r.raise_for_status(); return r.json()
     raise RuntimeError("Too many retries / rate-limited")
 
+_user_cache = {}
+
 def search_ticket_ids(start, end):
     # Format in ISO8601 without microseconds and with Z for UTC
     start_str = start.strftime("%Y-%m-%dT%H:%M:%SZ")
