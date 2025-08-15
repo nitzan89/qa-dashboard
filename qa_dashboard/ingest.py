@@ -253,7 +253,7 @@ public_comments = []
 
 for idx, c in enumerate(comments):
     author_id = c.get("author_id")
-    au = get_user(author_id)  # returns stub for -1/None/404/400
+    au = get_user(author_id)  # safe fetch
     a_email = (au.get("email") or "").lower()
     a_name = au.get("name") or "Unknown"
     body = c.get("html_body") or c.get("body") or ""
@@ -262,7 +262,7 @@ for idx, c in enumerate(comments):
     public_comments.append(
         (
             tid,              # ticket_id
-            idx,              # idx
+            idx,              # comment index
             c.get("created_at"),
             1 if public else 0,
             author_id,
@@ -272,7 +272,7 @@ for idx, c in enumerate(comments):
         )
     )
 
-    # Human agent public reply (not requester, not bot, and has an email)
+    # Human agent public reply (not requester, not bot, has email)
     if public and a_email and (a_email not in BOT_EMAILS) and (a_email != requester_email):
         has_human_reply = True
 
@@ -280,14 +280,6 @@ for idx, c in enumerate(comments):
 if not has_human_reply:
     continue
 
-
-                    # Human agent public reply (not the requester, not a bot)
-                    if public and a_email not in BOT_EMAILS and a_email != requester_email:
-                        has_human_reply = True
-
-                if not has_human_reply:
-                    # Bot-only or no agent reply → skip
-                    continue
 
                 # Audits → capture macro titles if applied
                 macro_titles = []
