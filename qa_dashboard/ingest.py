@@ -5,20 +5,53 @@ from typing import Dict, List, Optional
 
 import requests
 
-# ─────────── Read credentials (env first, then Streamlit Secrets) ─────────── #
+# ───────── Credentials (env first, then Streamlit Secrets) ───────── #
 SUBDOMAIN = os.getenv("ZD_SUBDOMAIN")
 EMAIL = os.getenv("ZD_EMAIL")
 TOKEN = os.getenv("ZD_API_TOKEN")
 try:
-    # Only used if running on Streamlit Cloud; harmless locally.
-    import streamlit as st
+    import streamlit as st  # optional on Streamlit Cloud
     SUBDOMAIN = SUBDOMAIN or st.secrets.get("ZD_SUBDOMAIN")
     EMAIL = EMAIL or st.secrets.get("ZD_EMAIL")
     TOKEN = TOKEN or st.secrets.get("ZD_API_TOKEN")
 except Exception:
     pass
 
-from config import BOT_EMAILS, CUSTOM_FIELDS
+# ───────── Pull optional BOT_EMAILS & CUSTOM_FIELDS from config ───────── #
+# We’ll merge with your Apps Script values (below) so it “just works”.
+try:
+    from config import BOT_EMAILS as CONFIG_BOT_EMAILS  # type: ignore
+except Exception:
+    CONFIG_BOT_EMAILS = None
+
+try:
+    from config import CUSTOM_FIELDS as CONFIG_CUSTOM_FIELDS  # type: ignore
+except Exception:
+    CONFIG_CUSTOM_FIELDS = None
+
+# == From your Apps Script ==
+# Emails for known bot accounts (exactly as in your GAS)
+BOT_EMAILS_DEFAULT = {"ilya@candivore.io"}
+
+# Zendesk custom field IDs (from your GAS). Mapped to the names our app expects.
+CUSTOM_FIELDS_DEFAULT = {
+    "topic": 360019266879,        # GAS: 360019266879
+    "sub_topic": 5066696830106,   # GAS: 5066696830106
+    "version": 1260819767490,     # GAS: 1260819767490
+    "language": 5428339880602,    # GAS: 5428339880602
+    "payer_tier": 6645722066458,  # GAS 'segment_payer' -> payer_tier here
+    # Not used in this app but provided in GAS:
+    # "user_id": 360007137153,
+    # "vlog": 360017297540,
+    # "assignee_name": 9433810178970,
+}
+
+# Final effective settings (config overrides default if provided)
+BOT_EMAILS = set(CONFIG_BOT_EMAILS) if CONFIG_BOT_EMAILS else set(BOT_EMAILS_DEFAULT)
+CUSTOM_FIELDS = dict(CUSTOM_FIELDS_DEFAULT)
+if isinstance(CONFIG_CUSTOM_FIELDS, dict):
+    CUSTOM_FIELDS.update({k: v for k, v in CONFIG_CUSTOM_FIELDS.items() if v})
+
 from db import (
     get_conn,
     init_db,
@@ -28,8 +61,7 @@ from db import (
     rebuild_fts,
 )
 
-
-# ───────────────────────────── HTTP helpers ───────────────────────────── #
+# ───────────────────────── HTTP helpers ───────────────────────── #
 
 def _base() -> str:
     if not SUBDOMAIN or not EMAIL or not TOKEN:
@@ -54,7 +86,7 @@ def get_json(url: str, params: Optional[Dict] = None) -> Dict:
     raise RuntimeError("Too many retries (Zendesk API rate limit).")
 
 
-# ───────────────────────────── Caches ───────────────────────────── #
+# ───────────────────────── Caches ───────────────────────── #
 
 _user_cache: Dict[int, Dict] = {}
 _group_cache: Dict[int, Dict] = {}
@@ -112,7 +144,6 @@ def get_user_group_names(user_id: int) -> List[str]:
             if name:
                 names.append(name)
         except Exception:
-            # ignore group fetch errors per item; keep going
             pass
     return names
 
@@ -132,7 +163,7 @@ def infer_bpo_from_groups(group_names: List[str]) -> Optional[str]:
     return None
 
 
-# ───────────────────────────── Ticket endpoints ───────────────────────────── #
+# ───────────────────────── Ticket endpoints ───────────────────────── #
 
 def get_ticket(ticket_id: int) -> Dict:
     return get_json(f"{_base()}/tickets/{ticket_id}.json").get("ticket", {}) or {}
@@ -148,7 +179,7 @@ def get_audits(ticket_id: int) -> List[Dict]:
 
 def extract_custom_field(ticket: Dict, name: str):
     """
-    Pull a custom field by id from config.CUSTOM_FIELDS mapping.
+    Pull a custom field by id from our effective CUSTOM_FIELDS mapping.
     """
     fid = CUSTOM_FIELDS.get(name)
     if not fid:
@@ -162,7 +193,7 @@ def extract_custom_field(ticket: Dict, name: str):
 def search_ticket_ids(start_dt: datetime, end_dt: datetime):
     """
     Use Search API to find solved tickets updated in [start_dt, end_dt) window.
-    IMPORTANT: Zendesk Search requires timestamps without microseconds and with 'Z' (UTC).
+    Zendesk Search requires timestamps without microseconds and with 'Z' (UTC).
     """
     start_str = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     end_str = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -180,21 +211,20 @@ def search_ticket_ids(start_dt: datetime, end_dt: datetime):
         next_page = data.get("next_page")
         if not next_page:
             break
-        # next_page is a full URL
         url, params = next_page, None
 
 
-# ───────────────────────────── Ingest main ───────────────────────────── #
+# ───────────────────────── Ingest main ───────────────────────── #
 
 def ingest(days: int = 5) -> str:
     """
     Pull tickets updated in the last {days}, store in SQLite.
-    Rules:
       - Only status: solved (includes reopened→resolved because we filter by updated_at).
       - Skip unassigned tickets.
-      - Skip tickets assigned to bot emails (from config.BOT_EMAILS).
+      - Skip tickets assigned to bot emails.
       - Require at least one human public reply (author != requester and not a bot).
       - Derive BPO from assignee's group memberships.
+      - Populate custom fields using your field IDs.
     """
     init_db()
 
@@ -289,6 +319,13 @@ def ingest(days: int = 5) -> str:
                 # Flatten tags
                 tags = ",".join(t.get("tags", []))
 
+                # Custom fields via your IDs
+                payer_tier = extract_custom_field(t, "payer_tier")
+                language = extract_custom_field(t, "language")
+                topic = extract_custom_field(t, "topic")
+                sub_topic = extract_custom_field(t, "sub_topic")
+                version = extract_custom_field(t, "version")
+
                 # Build ticket row in the exact schema order
                 ticket_row = (
                     t.get("id"),
@@ -304,12 +341,12 @@ def ingest(days: int = 5) -> str:
                     assignee_id,
                     assignee_email,
                     assignee_name,
-                    bpo,  # derived from groups
-                    extract_custom_field(t, "payer_tier"),
-                    extract_custom_field(t, "language"),
-                    extract_custom_field(t, "topic"),
-                    extract_custom_field(t, "sub_topic"),
-                    extract_custom_field(t, "version"),
+                    bpo,          # derived from groups
+                    payer_tier,   # from your field IDs
+                    language,
+                    topic,
+                    sub_topic,
+                    version,
                     tags,
                 )
                 upsert_ticket(conn, ticket_row)
