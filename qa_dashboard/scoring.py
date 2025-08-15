@@ -19,17 +19,49 @@ def personalization_overlap(user_text: str, agent_reply: str, threshold: float =
     a=top_terms(user_text,12); b=top_terms(agent_reply,12)
     return jaccard_similarity(a,b)>=threshold
 def score_ticket(t: Dict, comments: List[dict], weights: Dict, cfg: Dict) -> Tuple[int, List[str]]:
-    s,reasons=0,[]
-    csat=t.get("csat")
-    if csat is not None and csat<=2: s+=weights["low_csat"]; reasons.append("Low CSAT")
-    if cfg.get("sensitive_hit",False): s+=weights["sensitive"]; reasons.append("Sensitive keyword")
-    if multiple_humans_in_thread(comments): s+=weights["multi_agents"]; reasons.append("Multiple authors")
-    if t.get("payer_tier") in ("VIP","Whale") and cfg.get("is_complaint",False): s+=weights["vip_complaint"]; reasons.append("VIP complaint")
-    if t.get("reopened_recently"): s+=weights["reopened"]; reasons.append("Reopened")
-    if cfg.get("macro_mismatch",False): s+=weights["macro_mismatch"]; reasons.append("Macro–topic mismatch")
-    if long_thread(comments): s+=weights["long_thread"]; reasons.append("Long thread")
-    if cfg.get("multi_topic",False): s+=weights["multi_topic"]; reasons.append("Multi-topic")
-    if (csat is not None and csat>=5) and cfg.get("personalization",False): s+=weights["excellent_personalization"]; reasons.append("Personalized & positive")
-    if cfg.get("empathy",False): s+=weights["empathy"]; reasons.append("Empathy")
-    if cfg.get("easy_only",False) and not cfg.get("sensitive_hit",False): s+=weights["easy_issue_penalty"]; reasons.append("Easy tech-only")
-    return s,reasons
+    s, reasons = 0, []
+
+    # --- robust CSAT parse ---
+    csat_raw = t.get("csat")
+    try:
+        csat = int(float(csat_raw)) if csat_raw not in (None, "", "None") else None
+    except (ValueError, TypeError):
+        csat = None
+    # -------------------------
+
+    if csat is not None and csat <= 2:
+        s += weights["low_csat"]
+        reasons.append("Low CSAT")
+    if cfg.get("sensitive_hit", False):
+        s += weights["sensitive"]
+        reasons.append("Sensitive keyword")
+    if multiple_humans_in_thread(comments):
+        s += weights["multi_agents"]
+        reasons.append("Multiple authors")
+    if t.get("payer_tier") in ("VIP", "Whale") and cfg.get("is_complaint", False):
+        s += weights["vip_complaint"]
+        reasons.append("VIP complaint")
+    if t.get("reopened_recently"):
+        s += weights["reopened"]
+        reasons.append("Reopened")
+    if cfg.get("macro_mismatch", False):
+        s += weights["macro_mismatch"]
+        reasons.append("Macro–topic mismatch")
+    if long_thread(comments):
+        s += weights["long_thread"]
+        reasons.append("Long thread")
+    if cfg.get("multi_topic", False):
+        s += weights["multi_topic"]
+        reasons.append("Multi-topic")
+    if (csat is not None and csat >= 5) and cfg.get("personalization", False):
+        s += weights["excellent_personalization"]
+        reasons.append("Personalized & positive")
+    if cfg.get("empathy", False):
+        s += weights["empathy"]
+        reasons.append("Empathy")
+    if cfg.get("easy_only", False) and not cfg.get("sensitive_hit", False):
+        s += weights["easy_issue_penalty"]
+        reasons.append("Easy tech-only")
+
+    return s, reasons
+
