@@ -189,6 +189,10 @@ def ingest(days: int = 5) -> str:
     """
     init_db()
 
+        # NEW: writer-side timeout hint (extra safety; db.py already sets pragmas)
+    with get_conn() as _conn:
+        _conn.execute("PRAGMA busy_timeout=5000;")
+
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=days)
 
