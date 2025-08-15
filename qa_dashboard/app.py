@@ -175,7 +175,7 @@ df["ticket_url"] = df["id"].apply(
 st.subheader("Tickets")
 st.caption("Filtered list. Click a row’s link to open in Zendesk.")
 
-df_view = df.copy().rename(columns={"id_str": "Ticket ID"})
+df_view = df.copy()  # keep 'id_str' as-is
 st.dataframe(
     df_view[
         [
