@@ -23,7 +23,6 @@ def strip_html(x: str) -> str:
         return ""
     return TAG_RE.sub(" ", str(x))
 
-
 # ───────────────────────── Top toolbar ───────────────────────── #
 today = date.today()
 default_start = today - timedelta(days=5)
@@ -39,6 +38,7 @@ with c1:
     )
 
 with c2:
+    # Pick window (calendar-day windows for presets; custom uses date range)
     if preset == "Custom range":
         dr = st.date_input("Date range", value=(default_start, today))
         if isinstance(dr, tuple):
@@ -59,28 +59,37 @@ with c3:
     include_kw = st.text_input("Include keywords", "")
     exclude_kw = st.text_input("Exclude keywords", "")
 
+def compute_selected_days(preset_val: str, s_date: date, e_date: date) -> int:
+    if preset_val == "Last 24h":
+        return 1
+    if preset_val == "Last 3 days":
+        return 3
+    if preset_val == "Last 5 days":
+        return 5
+    # Custom: inclusive of both endpoints
+    return max(1, (e_date - s_date).days + 1)
+
+selected_days = compute_selected_days(preset, start_date, end_date)
+
 with c4:
     load_clicked = st.button("🔄 Load tickets", disabled=st.session_state.ingesting)
     if load_clicked:
         st.session_state.ingesting = True
         try:
-            # Always ingest the last 5 days; UI window filters what you see.
             prog = st.progress(0)
             log_box = st.empty()
 
             def cb(step, total, msg):
-                # clamp to [0,1]
                 frac = 0 if total == 0 else min(1.0, max(0.0, step / float(total)))
                 prog.progress(frac, text=msg)
                 log_box.info(msg)
 
-            with st.spinner("Fetching last 5 day(s) from Zendesk…"):
-                msg = ingest_mod.ingest(days=5, progress_cb=cb)
+            with st.spinner(f"Fetching last {selected_days} day(s) from Zendesk…"):
+                msg = ingest_mod.ingest(days=selected_days, progress_cb=cb)
             st.toast(msg, icon="✅")
             prog.progress(1.0, text="Done")
         finally:
             st.session_state.ingesting = False
-
 
 with st.expander("Advanced filters (optional)", expanded=False):
     include_tags = st.text_input("Include tags (comma-separated)", "")
@@ -102,7 +111,6 @@ with st.expander("Advanced filters (optional)", expanded=False):
 if st.session_state.ingesting:
     st.info("Fetching data… please wait a moment.")
     st.stop()
-
 
 # ───────────────────── Load & base filtering from DB ───────────────────── #
 init_db()
@@ -132,8 +140,7 @@ df["id"] = pd.to_numeric(df["id"], errors="coerce").astype("Int64")
 df["csat"] = pd.to_numeric(df["csat"], errors="coerce")
 df["updated_at_dt"] = pd.to_datetime(df["updated_at"], errors="coerce", utc=True).dt.tz_convert(None)
 
-# Date window filter (calendar day window for presets)
-# If you prefer rolling 24h, we can switch this to now - 24h.
+# Date window filter (calendar-day window for presets & custom)
 start_dt = datetime.combine(start_date, datetime.min.time())
 end_dt = datetime.combine(end_date, datetime.max.time())
 df = df[(df["updated_at_dt"] >= start_dt) & (df["updated_at_dt"] <= end_dt)]
@@ -144,7 +151,6 @@ if df.empty:
         "or widen the date range / clear filters."
     )
     st.stop()
-
 
 # ───────────── Build comments map (for keywords & preview) ───────────── #
 ticket_ids = df["id"].dropna().astype(int).tolist()
@@ -189,7 +195,6 @@ def subject_for_ticket(tid: int) -> str:
 
 df["subject_clean"] = df["id"].apply(lambda x: subject_for_ticket(int(x)))
 
-
 # ───────────── Strong filters (tags + HTML-aware keywords) ───────────── #
 def split_tags(s: str):
     if not s:
@@ -210,7 +215,6 @@ default_exc = set(t.lower() for t in DEFAULT_EXCLUDED_TAGS)
 def tags_ok(tag_string: str) -> bool:
     tags = [t.strip().lower() for t in (tag_string or "").split(",") if t.strip()]
     tagset = set(tags)
-
     if apply_default_exclusions and (tagset & default_exc):
         return False
     if user_exc_tags and (tagset & user_exc_tags):
@@ -251,7 +255,6 @@ if df.empty:
     st.info("No tickets match your filters. Clear filters or change the range.")
     st.stop()
 
-
 # ───────────── Optional: latest macros used (from audits) ───────────── #
 macros_map = {}
 with get_conn() as conn:
@@ -275,7 +278,6 @@ with get_conn() as conn:
         for tid, macros in cur.fetchall():
             macros_map[int(tid)] = macros or ""
 df["macros_used"] = df["id"].apply(lambda x: macros_map.get(int(x), ""))
-
 
 # ───────────── Pretty table (no tags/dates; short link) ───────────── #
 df["id_str"] = df["id"].astype(str)
