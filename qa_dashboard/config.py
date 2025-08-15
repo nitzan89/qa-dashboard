@@ -1,5 +1,13 @@
 import os
-DEFAULT_EXCLUDED_TAGS = ["connection","connection_issue","lag","crash","game_crash","network","timeout","opp_out_of_time"]
+
+DEFAULT_EXCLUDED_TAGS = [
+    "connection", "connection_issue", "closed_by_merge", "swat", "swat_mass_reply",
+    "backlog_mode", "game_crash", "opp_out_of_time", "kb_003", "kb_005", "kb_006", "kb_010",
+    "duplicate_stickers", "friend_invite_prize", "friend_fiesta_prizes",
+    "repeated_complaints", "repeated_technical", "kb_002",
+    "game_lag", "lags_issue"
+]
+
 BOT_EMAILS = {"ilya@candivore.io","maor@candivore.io"}
 CUSTOM_FIELDS = {"topic": None, "sub_topic": None, "version": None, "language": None, "payer_tier": None}
 SENSITIVE_KEYWORDS = ["gdpr","privacy","personal data","delete account","lawsuit","legal","harassment","bully","abuse"]
