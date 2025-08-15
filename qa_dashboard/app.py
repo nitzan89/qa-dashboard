@@ -50,6 +50,16 @@ with get_conn() as conn:
     """, (f'-{days} days',))
     rows = cur.fetchall()
 
+
+# If there are no rows yet (fresh DB), stop before we touch df["id"]
+cols = ["id","status","subject","created_at","updated_at","solved_at","csat","csat_offered",
+        "requester_email","assignee_email","assignee_name","bpo","payer_tier","language","topic","sub_topic","version","tags"]
+df = pd.DataFrame(rows, columns=cols)
+
+if df.empty:
+    st.warning("No tickets yet. Click **Refresh data (pull last 5 days)** in the sidebar.")
+    st.stop()
+
 cols = ["id","status","subject","created_at","updated_at","solved_at","csat","csat_offered",
         "requester_email","assignee_email","assignee_name","bpo","payer_tier","language","topic","sub_topic","version","tags"]
 df = pd.DataFrame(rows, columns=cols)
